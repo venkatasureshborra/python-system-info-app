@@ -1,0 +1,48 @@
+replicaCount: 2
+
+image:
+  repository: venkat14489/python-cloud-demo-app
+  tag: latest
+  pullPolicy: Always
+
+containerPort: 8080
+
+env:
+  APP_PORT: "8080"
+
+service:
+  type: ClusterIP
+  port: 80
+
+ingress:
+  enabled: true
+  className: alb
+  path: /
+  pathType: Prefix
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+
+livenessProbe:
+  path: /health/live
+  initialDelaySeconds: 10
+  periodSeconds: 10
+  failureThreshold: 3
+
+readinessProbe:
+  path: /health/ready
+  initialDelaySeconds: 5
+  periodSeconds: 5
+  failureThreshold: 3
+
+resources:
+  requests:
+    memory: "128Mi"
+    cpu: "250m"
+  limits:
+    memory: "256Mi"
+    cpu: "500m"
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
