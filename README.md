@@ -74,6 +74,8 @@ terraform apply
   - click on Terraform workflow
   - Then click on workflow dispatch
      - select the ENV and Apply/destroy the Infrastructure
+        - if you want different configuration for enviornment just upload to s3 bucket
+           - aws s3 cp prod.tfvars s3://tfvars-buckets/prod.tfvars
 
 
 This will:
