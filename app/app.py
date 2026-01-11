@@ -12,7 +12,7 @@ def home():
     return f"""
     <html>
         <body style="font-family: Arial;">
-            <h1> Python Application - Deployed by Venkata Suresh </h1>
+            <h1> Python Application - Deployement by Venkata Suresh </h1>
             <p><b>Hostname:</b> {hostname}</p>
             <p><b>Server IP:</b> {ip_address}</p>
             <p><b>Status:</b> Application running</p>
