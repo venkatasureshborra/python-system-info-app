@@ -1,0 +1,168 @@
+name: App Deployment-CI/CD
+
+on:
+  push:
+    branches:
+      - master
+    paths-ignore:
+      - 'terraform/**'
+      - 'README.md'
+      - '.github/terraform-cd.yaml'
+jobs:
+  deployment-of-app:
+    runs-on: self-hosted
+
+    env:
+      IMAGE_NAME: python-cloud-demo-app
+      RELEASE_NAME: python-app
+      NAMESPACE: default
+    
+    steps:
+    - name: Checkout source code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ secrets.AWS_REGION }}
+
+    # -----------------------------
+    # install unzip , curl , aws cli, kubectl, terraform, trivy, jq, helm and docker if not present in self-hosted runner
+    # -----------------------------
+    - name: Ensure unzip & curl
+      run: |
+        command -v unzip >/dev/null 2>&1 || ( sudo apt-get update && sudo apt-get install -y unzip)
+        command -v curl >/dev/null || sudo apt-get install -y curl
+
+    - name: Ensure Docker
+      run: |
+        command -v docker >/dev/null 2>&1 || ( curl -fsSL https://get.docker.com | sudo sh && sudo usermod -aG docker $USER )
+
+    - name: Ensure AWS CLI
+      run: |
+        command -v aws >/dev/null || (
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip &&
+          unzip awscliv2.zip &&
+          sudo ./aws/install
+        )
+
+    - name: Ensure kubectl
+      run: |
+        command -v kubectl >/dev/null 2>&1 || ( curl -LO https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl &&
+         chmod +x kubectl &&  
+         sudo mv kubectl /usr/local/bin/ )
+         
+    - name: Ensure jq
+      run: |
+        command -v jq >/dev/null 2>&1 || (sudo apt-get install -y jq)
+
+    - name: Ensure Trivy
+      run: |
+        command -v trivy >/dev/null 2>&1 || ( curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin )
+  
+    - name: Ensure Terraform
+      run: |
+        command -v terraform >/dev/null || (
+          curl -fsSL https://releases.hashicorp.com/terraform/1.6.6/terraform_1.6.6_linux_amd64.zip -o terraform.zip &&
+          unzip terraform.zip &&
+          sudo mv terraform /usr/local/bin/
+        )
+    - name: Ensure Helm
+      run: |  
+        command -v helm >/dev/null 2>&1 || ( curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash )
+   
+   # detect changes in app folder or Docker folder
+    - name: Detect app folder changes
+      run: |
+        if git diff --name-only ${{ github.event.before }} ${{ github.sha }} | grep -E '^(app/|Docker/)'; then
+          echo "APP_CHANGED=true" >> $GITHUB_ENV
+        else
+          echo "APP_CHANGED=false" >> $GITHUB_ENV
+        fi
+     # generate image tag using git commit hash
+    - name: Generate image tag
+      if: env.APP_CHANGED == 'true'
+      run: |
+        IMAGE_TAG=$(git rev-parse --short HEAD)
+        echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
+    # -----------------------------
+    # Build, Scan and Push Docker Image to Docker Hub if app or Docker Folder  has changes
+    # -----------------------------
+    - name: Fetch Docker Hub credentials from AWS Secrets Manager
+      run: |
+        SECRET=$(aws secretsmanager get-secret-value \
+          --secret-id dockerhub-credentials \
+          --query SecretString \
+          --output text)
+
+        echo "DOCKER_USERNAME=$(echo $SECRET | jq -r .DOCKER_USERNAME)" >> $GITHUB_ENV
+        echo "DOCKER_PASSWORD=$(echo $SECRET | jq -r .DOCKER_PASSWORD)" >> $GITHUB_ENV
+
+    - name: Login to Docker Hub
+      run: |
+        echo "$DOCKER_PASSWORD" | docker login \
+          -u "$DOCKER_USERNAME" --password-stdin
+
+    - name: Build Docker image
+      if: env.APP_CHANGED == 'true'
+      run: |
+        docker build -f Docker/Dockerfile -t $DOCKER_USERNAME/$IMAGE_NAME:$IMAGE_TAG .
+
+    - name: Scan Docker image with Trivy
+      if: env.APP_CHANGED == 'true'
+      run: |
+        trivy image \
+        --severity CRITICAL,HIGH \
+        --exit-code 1 \
+        --ignore-unfixed \
+        --output trivy-vuln-report.json \
+        $DOCKER_USERNAME/$IMAGE_NAME:$IMAGE_TAG
+
+    - name: Push Docker image to Docker Hub
+      if: env.APP_CHANGED == 'true'
+      run: |
+        docker push $DOCKER_USERNAME/$IMAGE_NAME:$IMAGE_TAG
+
+    # get the kubeconfig for EKS cluster
+    - name: Update kubeconfig for EKS
+      run: |
+       aws eks update-kubeconfig \
+       --name "${{ secrets.EKS_CLUSTER_NAME }}" \
+       --region "${{ secrets.AWS_REGION }}"
+
+    # get current deployed image tag if app folder has no changes
+    - name: Get current deployed image tag
+      if: env.APP_CHANGED == 'false'
+      run: |
+        CURRENT_IMAGE=$(kubectl get deployment $RELEASE_NAME -n $NAMESPACE \
+          -o jsonpath='{.spec.template.spec.containers[0].image}')
+        IMAGE_TAG=${CURRENT_IMAGE##*:}
+        echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
+        echo "Reusing image tag: $IMAGE_TAG"
+
+    # deploy the application using Helm chart
+    - name: Deploy application using Helm
+      run: |
+        helm upgrade --install $RELEASE_NAME k8s/helm/python-app \
+          --namespace $NAMESPACE \
+          --create-namespace \
+          --set image.repository=$DOCKER_USERNAME/$IMAGE_NAME \
+          --set image.tag=$IMAGE_TAG
+
+   # deploy the application to EKS
+    - name: Verify deployment
+      run: |
+        kubectl rollout status deployment/$RELEASE_NAME -n $NAMESPACE
+
+    - name: Get Ingress address
+      run: |
+       INGRESS_NAME=$RELEASE_NAME
+       echo "Waiting for Ingress address..."
+       sleep 10
+       ADDRESS=$(kubectl describe ingress $INGRESS_NAME -n $NAMESPACE | grep -i  address | awk '{print $2}')
+       echo "Ingress Address: http://$ADDRESS"
+        

@@ -1,0 +1,134 @@
+name: Terraform CI/CD
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - 'terraform/**'
+
+  pull_request:
+    paths:
+      - 'terraform/**'
+
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Terraform action"
+        required: true
+        default: apply
+        type: choice
+        options:
+          - apply
+          - destroy
+
+      environment:
+        description: "Target environment"
+        required: true
+        default: dev
+        type: choice
+        options:
+          - dev
+          - prod
+
+jobs:
+  terraform:
+    runs-on: self-hosted
+
+    defaults:
+      run:
+        working-directory: terraform
+
+    steps:
+    # Checkout code
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    # -------------------------------
+    # Ensure unzip, Node.js, Terraform, AWS CLI are installed if not present install them in the self-hosted runner
+    # -------------------------------
+    - name: Ensure unzip
+      run: command -v unzip >/dev/null || (sudo apt-get update && sudo apt-get install -y unzip)
+
+    - name: Ensure Node.js
+      run: |
+        command -v node >/dev/null || (
+          curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+          sudo apt-get install -y nodejs
+        )
+
+    - name: Ensure Terraform
+      run: |
+        command -v terraform >/dev/null || (
+          curl -fsSL https://releases.hashicorp.com/terraform/1.6.6/terraform_1.6.6_linux_amd64.zip -o terraform.zip &&
+          unzip terraform.zip &&
+          sudo mv terraform /usr/local/bin/
+        )
+
+    - name: Ensure AWS CLI
+      run: |
+        command -v aws >/dev/null || (
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip &&
+          unzip awscliv2.zip &&
+          sudo ./aws/install
+        )
+
+    # -------------------------------
+    # Configure AWS Credentials
+    # -------------------------------
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ secrets.AWS_REGION }}
+
+    # -------------------------------
+    # Terraform commands
+    # -------------------------------
+    - name: Terraform Init
+      run: |
+        terraform init \
+          -reconfigure \
+          -lock-timeout=5m \
+          -backend-config="bucket=${{ secrets.BUCKET_NAME }}" \
+          -backend-config="key=${{ github.event.inputs.environment }}/terraform.tfstate" \
+          -backend-config="region=${{ secrets.AWS_REGION }}"
+
+    - name: Terraform Format Check
+      run: terraform fmt -check -recursive
+
+    - name: Terraform Validate
+      run: terraform validate
+  # -------------------------------
+    # Download tfvars from S3 an store the vars in runtime.tfvars
+    # -------------------------------
+    - name: Fetch tfvars from S3
+      run: |
+        aws s3 cp \
+         s3://${{ secrets.TFVARS_BUCKET }}/${{ github.event.inputs.environment }}.tfvars \
+         runtime.tfvars
+         
+      # terraform plan by using the downloaded tfvars
+    - name: Terraform Plan
+      run: terraform plan -var-file=runtime.tfvars > terraform.log 2>&1
+
+    # -------------------------------
+    # Apply / Destroy (MANUAL ONLY)
+    # -------------------------------
+    - name: Terraform Apply (silent)
+      if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply' }}
+      run: |
+        terraform apply -auto-approve -var-file=runtime.tfvars >> terraform.log 2>&1
+
+    - name: Terraform Destroy (silent)
+      if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'destroy' }}
+      run: |
+        terraform destroy -auto-approve -var-file=runtime.tfvars >> terraform.log 2>&1
+
+    # -------------------------------
+    # Cleanup
+    # -------------------------------
+    - name: Cleanup tfvars
+      if: always()
+      run: rm -f runtime.tfvars
